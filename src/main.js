@@ -11,8 +11,8 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setClearColor(0x000000, 1);
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
-camera.position.set(0, 0, 14);
+const camera = new THREE.PerspectiveCamera(48, 1, 0.1, 100);
+camera.position.set(0, 0, 9.5);
 camera.lookAt(0, 0, 0);
 
 const pointer = new THREE.Vector2(0, 0);
@@ -65,8 +65,8 @@ function createWavePoints({
   opacity,
   phaseOffset = 0,
 }) {
-  const countX = 140;
-  const spanX = 28;
+  const countX = 220;
+  const spanX = 52;
   const positions = new Float32Array(countX * 3);
 
   for (let i = 0; i < countX; i++) {
@@ -105,23 +105,24 @@ function createWavePoints({
 
 const waveFront = createWavePoints({
   color: 0xffffff,
-  yOffset: 0.55,
-  amplitude: 0.85,
-  dotSize: 0.22,
-  opacity: 0.95,
+  yOffset: 1.65,
+  amplitude: 2.85,
+  dotSize: 0.52,
+  opacity: 0.92,
   phaseOffset: 0,
 });
 
 const waveBack = createWavePoints({
-  color: 0x6a6a6a,
-  yOffset: -0.35,
-  amplitude: 0.75,
-  dotSize: 0.18,
-  opacity: 0.55,
+  color: 0x5c5c5c,
+  yOffset: -1.65,
+  amplitude: 2.65,
+  dotSize: 0.46,
+  opacity: 0.5,
   phaseOffset: Math.PI * 0.35,
 });
 
 const waveGroup = new THREE.Group();
+waveGroup.scale.set(1.08, 1.08, 1);
 waveGroup.add(waveBack);
 waveGroup.add(waveFront);
 scene.add(waveGroup);
@@ -129,8 +130,8 @@ scene.add(waveGroup);
 function updateWaveGeometry(points, time) {
   const { countX, spanX, yOffset, amplitude, phaseOffset, positions } =
     points.userData;
-  const wavelength = 4.2;
-  const speed = 1.15;
+  const wavelength = 7.5;
+  const speed = 1.05;
 
   for (let i = 0; i < countX; i++) {
     const t = i / (countX - 1);
