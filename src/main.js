@@ -1,4 +1,76 @@
 import * as THREE from "three";
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+import { VignetteShader } from "three/addons/shaders/VignetteShader.js";
+
+const LIFTED_BLACK = 0x0a0a0c;
+const WAVE_VERTEX = /* glsl */ `
+  attribute float aAlong;
+  uniform float uTime;
+  uniform float uYOffset;
+  uniform float uAmplitude;
+  uniform float uPhaseOffset;
+  uniform float uWavelength;
+  uniform float uSpeed;
+  uniform float uSpanX;
+  uniform float uZ;
+  uniform float uPointScale;
+  varying float vAlpha;
+
+  float edgeEnvelope(float t) {
+    return smoothstep(0.0, 0.12, t) * smoothstep(1.0, 0.88, t);
+  }
+
+  void main() {
+    float x = (aAlong - 0.5) * uSpanX;
+    float phase = (x / uWavelength) * 6.28318530718 - uTime * uSpeed + uPhaseOffset;
+    float wave = sin(phase);
+    float env = edgeEnvelope(aAlong);
+    vec3 pos = vec3(x, uYOffset + wave * uAmplitude * env, uZ);
+
+    float crest = 0.72 + 0.28 * max(0.0, wave);
+    vAlpha = env * crest;
+
+    vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+    gl_Position = projectionMatrix * mvPosition;
+    gl_PointSize = uPointScale * crest * env * (300.0 / -mvPosition.z);
+  }
+`;
+
+const WAVE_FRAGMENT = /* glsl */ `
+  uniform vec3 uColor;
+  uniform float uOpacity;
+  varying float vAlpha;
+
+  void main() {
+    vec2 uv = gl_PointCoord - vec2(0.5);
+    float d = length(uv);
+    float core = smoothstep(0.5, 0.22, d);
+    float alpha = core * uOpacity * vAlpha;
+    if (alpha < 0.004) discard;
+    gl_FragColor = vec4(uColor, alpha);
+  }
+`;
+
+const reduceMotionQuery = window.matchMedia(
+  "(prefers-reduced-motion: reduce)"
+);
+let reduceMotion = reduceMotionQuery.matches;
+reduceMotionQuery.addEventListener("change", (event) => {
+  reduceMotion = event.matches;
+  if (reduceMotion) {
+    targetTilt.set(0, 0);
+    frozenTime = clock.getElapsedTime();
+    stopLoop();
+    updateScene(0);
+    renderFrame();
+  } else {
+    startLoop();
+  }
+});
 
 const canvas = document.getElementById("wave-canvas");
 
@@ -6,13 +78,22 @@ const renderer = new THREE.WebGLRenderer({
   canvas,
   antialias: true,
   alpha: false,
+  powerPreference: "high-performance",
 });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.setClearColor(0x000000, 1);
+renderer.setPixelRatio(
+  Math.min(window.devicePixelRatio, window.innerWidth < 768 ? 1.5 : 2)
+);
+renderer.setClearColor(LIFTED_BLACK, 1);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.92;
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(48, 1, 0.1, 100);
-camera.position.set(0, 0, 9.5);
+scene.background = new THREE.Color(LIFTED_BLACK);
+scene.fog = new THREE.FogExp2(LIFTED_BLACK, 0.038);
+
+const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 100);
+camera.position.set(0, 0.28, 10.2);
 camera.lookAt(0, 0, 0);
 
 const pointer = new THREE.Vector2(0, 0);
@@ -20,159 +101,195 @@ const targetTilt = new THREE.Vector2(0, 0);
 const currentTilt = new THREE.Vector2(0, 0);
 
 function onPointerMove(event) {
+  if (reduceMotion) return;
   const x = event.clientX / window.innerWidth;
   const y = event.clientY / window.innerHeight;
   pointer.set(x * 2 - 1, -(y * 2 - 1));
-  targetTilt.set(pointer.x * 0.35, pointer.y * 0.2);
+  targetTilt.set(pointer.x * 0.22, pointer.y * 0.14);
 }
 
 window.addEventListener("pointermove", onPointerMove, { passive: true });
 
-function createDotTexture() {
-  const size = 64;
-  const c = document.createElement("canvas");
-  c.width = size;
-  c.height = size;
-  const ctx = c.getContext("2d");
-  const gradient = ctx.createRadialGradient(
-    size / 2,
-    size / 2,
-    0,
-    size / 2,
-    size / 2,
-    size / 2
-  );
-  gradient.addColorStop(0, "rgba(255,255,255,1)");
-  gradient.addColorStop(0.35, "rgba(255,255,255,0.85)");
-  gradient.addColorStop(1, "rgba(255,255,255,0)");
-  ctx.fillStyle = gradient;
-  ctx.fillRect(0, 0, size, size);
-  const texture = new THREE.CanvasTexture(c);
-  texture.needsUpdate = true;
-  return texture;
-}
-
-const dotTexture = createDotTexture();
-
-/**
- * Builds a row of dots that follow a traveling sine wave along X.
- */
-function createWavePoints({
-  color,
-  yOffset,
-  amplitude,
-  dotSize,
-  opacity,
-  phaseOffset = 0,
-}) {
-  const countX = 220;
-  const spanX = 52;
-  const positions = new Float32Array(countX * 3);
-
+function createShaderWave(config) {
+  const countX =
+    window.innerWidth < 768 ? Math.floor(config.countX * 0.75) : config.countX;
+  const along = new Float32Array(countX);
   for (let i = 0; i < countX; i++) {
-    const t = i / (countX - 1);
-    const x = (t - 0.5) * spanX;
-    positions[i * 3] = x;
-    positions[i * 3 + 1] = yOffset;
-    positions[i * 3 + 2] = 0;
+    along[i] = i / (countX - 1);
   }
 
   const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("aAlong", new THREE.BufferAttribute(along, 1));
+  geometry.setDrawRange(0, countX);
 
-  const material = new THREE.PointsMaterial({
-    color,
-    size: dotSize,
-    map: dotTexture,
+  const material = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 },
+      uYOffset: { value: config.yOffset },
+      uAmplitude: { value: config.amplitude },
+      uPhaseOffset: { value: config.phaseOffset },
+      uWavelength: { value: config.wavelength },
+      uSpeed: { value: config.speed },
+      uSpanX: { value: config.spanX },
+      uZ: { value: config.z },
+      uPointScale: { value: config.pointScale },
+      uColor: { value: new THREE.Color(config.color) },
+      uOpacity: { value: config.opacity },
+    },
+    vertexShader: WAVE_VERTEX,
+    fragmentShader: WAVE_FRAGMENT,
     transparent: true,
-    opacity,
     depthWrite: false,
-    blending: THREE.AdditiveBlending,
-    sizeAttenuation: true,
+    blending: THREE.NormalBlending,
   });
 
-  const points = new THREE.Points(geometry, material);
-  points.userData = {
-    countX,
-    spanX,
-    yOffset,
-    amplitude,
-    phaseOffset,
-    positions,
-  };
-  return points;
+  return new THREE.Points(geometry, material);
 }
 
-const waveFront = createWavePoints({
-  color: 0xffffff,
-  yOffset: 1.65,
-  amplitude: 2.85,
-  dotSize: 0.52,
-  opacity: 0.92,
+const waveFront = createShaderWave({
+  countX: 240,
+  color: 0xe8e4df,
+  yOffset: 1.72,
+  amplitude: 3.05,
   phaseOffset: 0,
+  wavelength: 7.4,
+  speed: 0.95,
+  spanX: 54,
+  z: 0.35,
+  pointScale: 5.2,
+  opacity: 0.88,
 });
 
-const waveBack = createWavePoints({
-  color: 0x5c5c5c,
-  yOffset: -1.65,
-  amplitude: 2.65,
-  dotSize: 0.46,
-  opacity: 0.5,
+const waveBack = createShaderWave({
+  countX: 220,
+  color: 0x6a6662,
+  yOffset: -1.78,
+  amplitude: 2.75,
   phaseOffset: Math.PI * 0.35,
+  wavelength: 7.8,
+  speed: 0.88,
+  spanX: 52,
+  z: -0.75,
+  pointScale: 4.4,
+  opacity: 0.42,
 });
 
 const waveGroup = new THREE.Group();
-waveGroup.scale.set(1.08, 1.08, 1);
+waveGroup.scale.set(1.12, 1.12, 1);
 waveGroup.add(waveBack);
 waveGroup.add(waveFront);
 scene.add(waveGroup);
 
-function updateWaveGeometry(points, time) {
-  const { countX, spanX, yOffset, amplitude, phaseOffset, positions } =
-    points.userData;
-  const wavelength = 7.5;
-  const speed = 1.05;
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
 
-  for (let i = 0; i < countX; i++) {
-    const t = i / (countX - 1);
-    const x = (t - 0.5) * spanX;
-    const phase = (x / wavelength) * Math.PI * 2 - time * speed + phaseOffset;
-    const y = yOffset + Math.sin(phase) * amplitude;
-    positions[i * 3] = x;
-    positions[i * 3 + 1] = y;
-    positions[i * 3 + 2] = 0;
-  }
+const bloomPass = new UnrealBloomPass(
+  new THREE.Vector2(window.innerWidth, window.innerHeight),
+  0.35,
+  0.55,
+  0.82
+);
+composer.addPass(bloomPass);
 
-  points.geometry.attributes.position.needsUpdate = true;
-}
+const vignettePass = new ShaderPass(VignetteShader);
+vignettePass.uniforms.offset.value = 0.92;
+vignettePass.uniforms.darkness.value = 1.35;
+composer.addPass(vignettePass);
+
+composer.addPass(new OutputPass());
 
 function resize() {
   const w = window.innerWidth;
   const h = window.innerHeight;
+  renderer.setPixelRatio(
+    Math.min(window.devicePixelRatio, w < 768 ? 1.5 : 2)
+  );
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  composer.setSize(w, h);
+  bloomPass.setSize(w, h);
+  renderFrame();
 }
 
 window.addEventListener("resize", resize);
 resize();
 
 const clock = new THREE.Clock();
+let frozenTime = 0;
+let animationId = null;
+let tabVisible = !document.hidden;
 
-function animate() {
-  const elapsed = clock.getElapsedTime();
+document.addEventListener("visibilitychange", () => {
+  tabVisible = !document.hidden;
+  if (tabVisible && !reduceMotion) {
+    startLoop();
+  } else {
+    stopLoop();
+    if (tabVisible) renderFrame();
+  }
+});
 
-  currentTilt.lerp(targetTilt, 0.06);
-  waveGroup.rotation.x = currentTilt.y * 0.15;
-  waveGroup.rotation.y = currentTilt.x * 0.12;
-  waveGroup.position.x = currentTilt.x * 0.25;
-  waveGroup.position.y = currentTilt.y * 0.15;
-
-  updateWaveGeometry(waveFront, elapsed);
-  updateWaveGeometry(waveBack, elapsed);
-
-  renderer.render(scene, camera);
-  requestAnimationFrame(animate);
+function damp(current, target, lambda, delta) {
+  return current + (target - current) * (1 - Math.exp(-lambda * delta));
 }
 
-animate();
+function updateScene(delta) {
+  const elapsed = reduceMotion ? frozenTime : clock.getElapsedTime();
+
+  if (!reduceMotion) {
+    currentTilt.x = damp(currentTilt.x, targetTilt.x, 7.5, delta);
+    currentTilt.y = damp(currentTilt.y, targetTilt.y, 7.5, delta);
+    waveGroup.rotation.x = currentTilt.y * 0.1;
+    waveGroup.rotation.y = currentTilt.x * 0.08;
+    waveGroup.position.x = currentTilt.x * 0.18;
+    waveGroup.position.y = currentTilt.y * 0.12;
+  } else {
+    waveGroup.rotation.set(0, 0, 0);
+    waveGroup.position.set(0, 0, 0);
+  }
+
+  waveFront.material.uniforms.uTime.value = elapsed;
+  waveBack.material.uniforms.uTime.value = elapsed;
+}
+
+function renderFrame() {
+  composer.render();
+}
+
+function animate() {
+  if (!tabVisible) return;
+  const delta = Math.min(clock.getDelta(), 0.05);
+  updateScene(delta);
+  renderFrame();
+  if (!reduceMotion) {
+    animationId = requestAnimationFrame(animate);
+  }
+}
+
+function startLoop() {
+  stopLoop();
+  if (reduceMotion) {
+    frozenTime = clock.getElapsedTime();
+    updateScene(0);
+    renderFrame();
+    return;
+  }
+  clock.start();
+  animationId = requestAnimationFrame(animate);
+}
+
+function stopLoop() {
+  if (animationId !== null) {
+    cancelAnimationFrame(animationId);
+    animationId = null;
+  }
+}
+
+if (reduceMotion) {
+  frozenTime = 0;
+  updateScene(0);
+  renderFrame();
+} else {
+  startLoop();
+}
